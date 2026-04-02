@@ -8,6 +8,8 @@ session context management and credential conversion functionality.
 
 import contextvars
 import logging
+import json
+import os
 from typing import Dict, Optional, Any, Tuple
 from threading import RLock
 from datetime import datetime, timedelta, timezone
@@ -178,6 +180,20 @@ def extract_session_from_headers(headers: Dict[str, str]) -> Optional[str]:
 # =============================================================================
 
 
+
+def _get_states_file() -> str:
+    workspace_creds_dir = os.getenv("WORKSPACE_MCP_CREDENTIALS_DIR")
+    if workspace_creds_dir:
+        base = os.path.expanduser(workspace_creds_dir)
+    else:
+        google_creds_dir = os.getenv("GOOGLE_MCP_CREDENTIALS_DIR")
+        if google_creds_dir:
+            base = os.path.expanduser(google_creds_dir)
+        else:
+            base = os.path.expanduser("~/.google_workspace_mcp/credentials")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "oauth_states.json")
+
 class OAuth21SessionStore:
     """
     Global store for OAuth 2.1 authenticated sessions.
@@ -201,9 +217,42 @@ class OAuth21SessionStore:
         self._oauth_states: Dict[str, Dict[str, Any]] = {}
         self._lock = RLock()
 
+    def _load_oauth_states_locked(self):
+        file_path = _get_states_file()
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._oauth_states = {}
+                for k, v in data.items():
+                    if "expires_at" in v and v["expires_at"]:
+                        v["expires_at"] = datetime.fromisoformat(v["expires_at"])
+                    if "created_at" in v and v["created_at"]:
+                        v["created_at"] = datetime.fromisoformat(v["created_at"])
+                    self._oauth_states[k] = v
+            except Exception as e:
+                logger.error(f"Failed to load OAuth states: {e}")
+
+    def _save_oauth_states_locked(self):
+        file_path = _get_states_file()
+        try:
+            data = {}
+            for k, v in self._oauth_states.items():
+                data[k] = {
+                    "session_id": v.get("session_id"),
+                    "expires_at": v.get("expires_at").isoformat() if v.get("expires_at") else None,
+                    "created_at": v.get("created_at").isoformat() if v.get("created_at") else None,
+                    "code_verifier": v.get("code_verifier"),
+                }
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.error(f"Failed to save OAuth states: {e}")
+
     def _cleanup_expired_oauth_states_locked(self):
         """Remove expired OAuth state entries. Caller must hold lock."""
         now = datetime.now(timezone.utc)
+        self._load_oauth_states_locked()
         expired_states = [
             state
             for state, data in self._oauth_states.items()
@@ -215,6 +264,8 @@ class OAuth21SessionStore:
                 "Removed expired OAuth state: %s",
                 state[:8] if len(state) > 8 else state,
             )
+        if expired_states:
+            self._save_oauth_states_locked()
 
     def store_oauth_state(
         self,
@@ -244,6 +295,7 @@ class OAuth21SessionStore:
                 state[:8] if len(state) > 8 else state,
                 expiry.isoformat(),
             )
+            self._save_oauth_states_locked()
 
     def validate_and_consume_oauth_state(
         self,
@@ -280,6 +332,7 @@ class OAuth21SessionStore:
             if bound_session and session_id and bound_session != session_id:
                 # Consume the state to prevent replay attempts
                 del self._oauth_states[state]
+                self._save_oauth_states_locked()
                 logger.error(
                     "SECURITY: OAuth state session mismatch (expected %s, got %s)",
                     bound_session,
@@ -287,8 +340,9 @@ class OAuth21SessionStore:
                 )
                 raise ValueError("OAuth state does not match the initiating session")
 
-            # State is valid – consume it to prevent reuse
+            # State is valid - consume it to prevent reuse
             del self._oauth_states[state]
+            self._save_oauth_states_locked()
             logger.debug(
                 "Validated OAuth state %s",
                 state[:8] if len(state) > 8 else state,
@@ -317,6 +371,7 @@ class OAuth21SessionStore:
                 ),
             )
             state_info = self._oauth_states.pop(latest_state)
+            self._save_oauth_states_locked()
             logger.debug(
                 "Consumed latest OAuth state %s as fallback",
                 latest_state[:8] if len(latest_state) > 8 else latest_state,
